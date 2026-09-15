@@ -202,6 +202,7 @@ export class MediaSession {
   sendToAsterisk(ulawChunk) {
     if (this.destroyed) return;
     this.audioReceived = true;
+    if (this.greetingSent && !this.greetingSpoken) this.markGreetingSpoken();
     this.enqueueAudio(ulawChunk);
   }
 
@@ -253,15 +254,21 @@ export class MediaSession {
     this.greetingSent = true;
     this.audioReceived = true;
     log('GREETING', { call_id: this.callId });
-    let data = null;
-    try { data = fs.readFileSync('assets/greeting.ulaw'); } catch {}
-    if (!data) try { data = fs.readFileSync('/opt/gemini-bridge/assets/greeting.ulaw'); } catch {}
-    if (!data) { this.speakText("How may I help you today?"); return; }
-    for(let i=0;i<data.length;i+=160){
-      this.enqueueAudio(data.subarray(i,i+160));
+    if (this.gemini && this.gemini.opened && !this.liveFailed) {
+      this.gemini.sendText('Start the call. Greet the caller warmly and ask "How may I help you today?" in one short sentence.');
+      if (this.greetingWatcher) clearTimeout(this.greetingWatcher);
+      this.greetingWatcher = setTimeout(()=> {
+        if (!this.greetingSpoken && !this.liveFailed) {
+          this.liveFailed = true;
+          this.speakText("How may I help you today?");
+        }
+      }, 4000);
+    } else {
+      this.speakText("How may I help you today?");
     }
-    log('GREETING_SENT', { call_id: this.callId, bytes: data.length });
   }
+
+  markGreetingSpoken() { this.greetingSpoken = true; }
 
   async destroy() {
     if (this.destroyed) return;
@@ -269,6 +276,7 @@ export class MediaSession {
     if (this.drainTimer) clearTimeout(this.drainTimer);
     if (this.ticker) { clearInterval(this.ticker); this.ticker = null; }
     if (this.fallbackTimer) clearTimeout(this.fallbackTimer);
+    if (this.greetingWatcher) clearTimeout(this.greetingWatcher);
     log('CALL_ENDED', { call_id: this.callId });
     try { this.gemini?.close(); } catch {}
     try { this.rtp?.sock.close(); } catch {}

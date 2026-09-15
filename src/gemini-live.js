@@ -13,6 +13,7 @@ export class GeminiLiveSession {
     this.session = null;
     this.connectedAt = 0;
     this.firstAudioAt = 0;
+    this.opened = false;
     this.closed = false;
   }
 
@@ -32,6 +33,7 @@ export class GeminiLiveSession {
       callbacks: {
         onopen: () => {
           this.connectedAt = Date.now();
+          this.opened = true;
           log('GEMINI_CONNECTED', { call_id: this.callId, ms: this.connectedAt });
         },
         onmessage: (msg) => this.handleMessage(msg),
@@ -93,6 +95,19 @@ export class GeminiLiveSession {
       log('CALLER_AUDIO', { call_id: this.callId, bytes: ulawBuf.length });
     } catch (e) {
       logError('GEMINI_SEND_ERROR', e, { call_id: this.callId });
+    }
+  }
+
+  sendText(txt) {
+    if (!this.session || this.closed) return;
+    try {
+      this.session.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: txt }] }],
+        turnComplete: true,
+      });
+      log('GEMINI_PROMPT', { call_id: this.callId, text: txt.slice(0, 120) });
+    } catch (e) {
+      logError('GEMINI_PROMPT_ERROR', e, { call_id: this.callId });
     }
   }
 
