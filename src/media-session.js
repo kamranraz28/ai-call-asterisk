@@ -2,7 +2,7 @@ import { createRtpSocket } from './rtp.js';
 import { GeminiLiveSession } from './gemini-live.js';
 import { log, logError } from './logger.js';
 import { config } from './config.js';
-import { pcm16BufferToUlawBuffer, ulawBufferToPcm16Buffer, resampleLinear } from './codecs.js';
+import { pcm16BufferToUlawBuffer, ulawBufferToPcm16Buffer, resampleLinear, dcBlocker, normalizeSoft } from './codecs.js';
 import fs from 'fs';
 
 export class MediaSession {
@@ -163,7 +163,7 @@ export class MediaSession {
         const b64 = resp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || resp.candidates?.[0]?.content?.parts?.find(p=>p.inlineData)?.inlineData?.data;
         if (b64) {
           const pcm24k = Buffer.from(b64, 'base64');
-          const pcm8k = resampleLinear(pcm24k, 24000, 8000);
+          const pcm8k = dcBlocker(normalizeSoft(resampleLinear(pcm24k, 24000, 8000), 0.7));
           let ulaw = pcm16BufferToUlawBuffer(pcm8k);
           const rem = ulaw.length % 160;
           if (rem !== 0) ulaw = Buffer.concat([ulaw, Buffer.alloc(160 - rem, 0x7f)]);

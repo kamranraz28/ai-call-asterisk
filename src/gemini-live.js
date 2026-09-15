@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { log, logError } from './logger.js';
-import { ulawBufferToPcm16Buffer, pcm16BufferToUlawBuffer, resampleLinear } from './codecs.js';
+import { ulawBufferToPcm16Buffer, pcm16BufferToUlawBuffer, resampleLinear, dcBlocker, normalizeSoft } from './codecs.js';
 
 export class GeminiLiveSession {
   constructor({ callId, apiKey, model, onAudioOut, onInterrupted, onClose }) {
@@ -58,8 +58,9 @@ export class GeminiLiveSession {
           } else {
             log('GEMINI_AUDIO', { call_id: this.callId, bytes: pcm24k.length });
           }
-          const pcm8k = resampleLinear(pcm24k, 24000, 8000);
-          const ulaw = Buffer.concat([pcm16BufferToUlawBuffer(pcm8k)]);
+          const pcm8kRaw = resampleLinear(pcm24k, 24000, 8000);
+          const clean = dcBlocker(normalizeSoft(pcm8kRaw, 0.7));
+          const ulaw = pcm16BufferToUlawBuffer(clean);
           this.chunkQueue(ulaw);
         }
       }
