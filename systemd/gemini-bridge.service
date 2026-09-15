@@ -1,0 +1,18 @@
+[Unit]
+Description=Asterisk Gemini Live Bridge (Node.js)
+After=network.target asterisk.service
+Wants=asterisk.service
+
+[Service]
+Type=simple
+User=asterisk
+WorkingDirectory=/opt/gemini-bridge
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=3
+EnvironmentFile=/opt/gemini-bridge/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
