@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import { log, logError } from './logger.js';
-import { ulawBufferToPcm16Buffer, pcm16BufferToUlawBuffer, resampleLinear, dcBlocker, normalizeSoft } from './codecs.js';
+import { ulawBufferToPcm16Buffer, pcm16BufferToUlawBuffer, resampleLinear, createStreamResampler, createStreamDcBlocker, softLimit } from './codecs.js';
 
 export class GeminiLiveSession {
   constructor({ callId, apiKey, model, onAudioOut, onInterrupted, onClose }) {
@@ -15,6 +15,8 @@ export class GeminiLiveSession {
     this.firstAudioAt = 0;
     this.opened = false;
     this.closed = false;
+    this.outResampler = createStreamResampler(24000, 8000);
+    this.outDc = createStreamDcBlocker();
   }
 
   async connect() {
@@ -23,7 +25,7 @@ export class GeminiLiveSession {
       model: this.model,
       config: {
         responseModalities: ['AUDIO'],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } },
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
         systemInstruction: 'You are a helpful phone assistant. Keep answers concise for phone call.',
       },
     };
@@ -58,18 +60,24 @@ export class GeminiLiveSession {
           } else {
             log('GEMINI_AUDIO', { call_id: this.callId, bytes: pcm24k.length });
           }
-          const pcm8kRaw = resampleLinear(pcm24k, 24000, 8000);
-          const clean = dcBlocker(normalizeSoft(pcm8kRaw, 0.7));
+          const pcm8kRaw = this.outResampler(pcm24k);
+          const clean = this.outDc(softLimit(pcm8kRaw));
           const ulaw = pcm16BufferToUlawBuffer(clean);
           this.chunkQueue(ulaw);
         }
       }
       if (msg?.serverContent?.interrupted) {
         log('AI_INTERRUPTED', { call_id: this.callId });
+        this.flushLeftover();
+        this.outResampler = createStreamResampler(24000, 8000);
+        this.outDc = createStreamDcBlocker();
         this.onInterrupted?.();
       }
       if (msg?.serverContent?.turnComplete) {
         log('AI_TURN_COMPLETE', { call_id: this.callId });
+        this.flushLeftover();
+        this.outResampler = createStreamResampler(24000, 8000);
+        this.outDc = createStreamDcBlocker();
       }
     } catch (e) {
       logError('GEMINI_MSG_ERROR', e, { call_id: this.callId });
@@ -78,9 +86,24 @@ export class GeminiLiveSession {
 
   chunkQueue(ulaw) {
     const chunkSize = 160;
-    for (let i = 0; i < ulaw.length; i += chunkSize) {
-      const c = ulaw.subarray(i, i + chunkSize);
-      this.onAudioOut(c);
+    if (this.leftover && this.leftover.length) {
+      ulaw = Buffer.concat([this.leftover, ulaw]);
+      this.leftover = null;
+    }
+    const full = ulaw.length - (ulaw.length % chunkSize);
+    for (let i = 0; i < full; i += chunkSize) {
+      this.onAudioOut(ulaw.subarray(i, i + chunkSize));
+    }
+    if (ulaw.length > full) this.leftover = ulaw.subarray(full);
+  }
+
+  // send any partial frame padded to a full 20ms frame so the RTP timeline
+  // stays perfectly uniform (no short packets => no periodic glitch)
+  flushLeftover() {
+    if (this.leftover && this.leftover.length) {
+      const pad = Buffer.alloc(160 - this.leftover.length, 0xff);
+      this.onAudioOut(Buffer.concat([this.leftover, pad]));
+      this.leftover = null;
     }
   }
 

@@ -149,13 +149,13 @@ export function normalizeSoft(pcm16Buf, targetPeak = 0.6) {
   const out = Buffer.alloc(pcm16Buf.length);
   for (let i = 0; i < n; i++) {
     let s = pcm16Buf.readInt16LE(i * 2) * gain;
-    // soft clip
+    // soft clip: knee below full scale so int16 can never wrap
     const x = s / 32767;
     let y;
-    const a = 1.2, k = 1.4;
+    const a = 0.98, k = 1.4;
     if (Math.abs(x) < a) y = x;
     else y = (a + ((Math.abs(x) - a) / ((Math.abs(x) - a) * k + 1))) * (x < 0 ? -1 : 1);
-    y = Math.max(-a, Math.min(a, y));
+    if (y > 1) y = 1; else if (y < -1) y = -1;
     out.writeInt16LE(Math.round(y * 32767), i * 2);
   }
   return out;
@@ -164,6 +164,66 @@ export function normalizeSoft(pcm16Buf, targetPeak = 0.6) {
 export function resampleLinear(pcm16Buf, fromRate, toRate) {
   if (fromRate === toRate) return pcm16Buf;
   return resampleSinc(pcm16Buf, fromRate, toRate);
+}
+
+// Stateful streaming resampler: keeps the fractional phase + sliding input
+// history across chunks so the 24k->8k stream is phase-continuous. This removes
+// the per-chunk boundary pops that independent one-shot resamples produce.
+export function createStreamResampler(fromRate, toRate, taps = 33) {
+  if (taps % 2 === 0) taps += 1; // odd so mid is integer
+  const ratio = fromRate / toRate;
+  const maxOut = 0.9 * (toRate / 2);
+  const maxIn = 0.9 * (fromRate / 2);
+  const cutoffHz = Math.min(maxIn, maxOut);
+  const cutoff = cutoffHz / fromRate;
+  const kernel = buildKernel(cutoff, taps);
+  const mid = (taps - 1) / 2;
+
+  let hist = new Float32Array(0);
+  let pos = 0;   // absolute input-sample position (fractional) of next output center
+  let base = 0;  // absolute input index of hist[0]
+
+  function step(pcm16Buf) {
+    const n = pcm16Buf.length / 2;
+    if (n === 0) return Buffer.alloc(0);
+    const newHist = new Float32Array(hist.length + n);
+    newHist.set(hist, 0);
+    for (let i = 0; i < n; i++) newHist[hist.length + i] = pcm16Buf.readInt16LE(i * 2);
+    hist = newHist;
+
+    const out = [];
+    while (pos + mid + 1 <= base + hist.length) {
+      const center = pos;
+      const startIdx = Math.floor(center) - mid;
+      let acc = 0;
+      for (let k = 0; k < taps; k++) {
+        const idx = startIdx + k;
+        const absIdx = idx - base;
+        if (absIdx < 0 || absIdx >= hist.length) continue;
+        const offset = center - idx;
+        const kpos = offset + mid;
+        const k0 = Math.floor(kpos);
+        const f = kpos - k0;
+        const h0 = k0 >= 0 && k0 < taps ? kernel[k0] : 0;
+        const h1 = k0 + 1 < taps ? kernel[k0 + 1] : 0;
+        acc += hist[absIdx] * (h0 * (1 - f) + h1 * f);
+      }
+      out.push(acc);
+      pos += ratio;
+    }
+    const keepFromAbs = Math.floor(pos - mid);
+    const trimStart = Math.max(0, keepFromAbs - base);
+    if (trimStart > 0) {
+      hist = hist.slice(trimStart);
+      base += trimStart;
+    }
+    const res = Buffer.alloc(out.length * 2);
+    for (let i = 0; i < out.length; i++) {
+      res.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(out[i]))), i * 2);
+    }
+    return res;
+  }
+  return step;
 }
 
 // Clear DC drift and low rumble that g.711 is sensitive to
@@ -178,6 +238,43 @@ export function dcBlocker(pcm16Buf) {
     if (y > 0x7fff) y = 0x7fff; else if (y < -0x8000) y = -0x8000;
     out.writeInt16LE(Math.round(y), i * 2);
     prev = y;
+  }
+  return out;
+}
+
+// Streaming DC blocker: carries filter state across chunks so we don't get
+// a restart click at every chunk boundary (the old dcBlocker reset prev=0).
+export function createStreamDcBlocker(alpha = 0.99) {
+  let prev = 0;
+  return function step(pcm16Buf) {
+    const n = pcm16Buf.length / 2;
+    const out = Buffer.from(pcm16Buf);
+    for (let i = 0; i < n; i++) {
+      const x = out.readInt16LE(i * 2);
+      let y = x - prev + alpha * prev;
+      if (y > 0x7fff) y = 0x7fff; else if (y < -0x8000) y = -0x8000;
+      out.writeInt16LE(Math.round(y), i * 2);
+      prev = y;
+    }
+    return out;
+  };
+}
+
+// Fixed soft-limiter: transparent below threshold, never wraps past 32767.
+// Unlike normalizeSoft it doesn't adapt gain per chunk (no pumping) and its
+// knee sits below full scale so int16 can't overflow (old code allowed it).
+export function softLimit(pcm16Buf, threshold = 0.98) {
+  const n = pcm16Buf.length / 2;
+  const out = Buffer.alloc(pcm16Buf.length);
+  const a = threshold, k = 8;
+  for (let i = 0; i < n; i++) {
+    let x = pcm16Buf.readInt16LE(i * 2) / 32767;
+    let y;
+    const ax = Math.abs(x);
+    if (ax < a) y = x;
+    else y = (a + (ax - a) / ((ax - a) * k + 1)) * (x < 0 ? -1 : 1);
+    if (y > 1) y = 1; else if (y < -1) y = -1;
+    out.writeInt16LE(Math.round(y * 32767), i * 2);
   }
   return out;
 }
